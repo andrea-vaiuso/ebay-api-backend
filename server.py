@@ -26,14 +26,12 @@ OAUTH_TOKEN_URL = f"{EBAY_API_ROOT}/identity/v1/oauth2/token"
 BROWSE_SEARCH_URL = f"{EBAY_API_ROOT}/buy/browse/v1/item_summary/search"
 DEFAULT_CATEGORY_ID = "6000"  # Auto Parts & Accessories
 
-# Scope: la Browse API usa OAuth scopes; per Browse tipicamente buy.browse / buy.item (dipende dagli endpoint).
-# Qui usiamo buy.browse per search. Verifica gli scopes abilitati sulla tua app keys page.  [oai_citation:4‡eBay Developers](https://developer.ebay.com/api-docs/static/oauth-scopes.html?utm_source=chatgpt.com)
 BROWSE_SCOPE = "https://api.ebay.com/oauth/api_scope"
 
 @dataclass
 class TokenCache:
     access_token: str = ""
-    expires_at: float = 0.0  # epoch seconds
+    expires_at: float = 0.0  
 
 TOKEN_CACHE = TokenCache()
 
@@ -62,7 +60,6 @@ def get_app_token() -> str:
 
     payload = r.json()
     TOKEN_CACHE.access_token = payload["access_token"]
-    # expires_in è in secondi (tipicamente 2 ore).  [oai_citation:5‡eBay Developers](https://developer.ebay.com/api-docs/static/oauth-client-credentials-grant.html?utm_source=chatgpt.com)
     TOKEN_CACHE.expires_at = now + int(payload.get("expires_in", 0))
     return TOKEN_CACHE.access_token
 
@@ -73,7 +70,6 @@ def build_compatibility_filter(
     trim: Optional[str],
     engine: Optional[str],
 ) -> Optional[str]:
-    # Formato da doc: "Year:2018;Make:BMW;Model:..."  [oai_citation:6‡eBay Developers](https://developer.ebay.com/api-docs/buy/browse/resources/item_summary/methods/search)
     parts = []
     if year:   parts.append(f"Year:{year}")
     if make:   parts.append(f"Make:{make}")
@@ -99,7 +95,6 @@ def normalize_items(search_json: Dict[str, Any]) -> Dict[str, Any]:
             },
             "imageUrl": image.get("imageUrl"),
             "itemWebUrl": it.get("itemWebUrl"),
-            # Se passi compatibility_filter, eBay può ritornare anche info di compatibilità nel summary.
             "compatibilityMatch": it.get("compatibilityMatch"),
             "compatibilityProperties": it.get("compatibilityProperties"),
         })
@@ -136,7 +131,6 @@ def ebay_search():
 
         if not query:
             return jsonify({"error": "Missing q"}), 400
-        # Join to the query the vehicle make/model/trim/year/engine if provided
         if vehicle_make:
             query = f"{vehicle_make} {query}"
         if vehicle_model:
@@ -148,7 +142,7 @@ def ebay_search():
         if engine:
             query = f"{engine} {query}"
 
-        token = get_app_token()  # <-- qui spesso esplode se OAuth non va
+        token = get_app_token()
 
         headers = {
             "Authorization": f"Bearer {token}",
