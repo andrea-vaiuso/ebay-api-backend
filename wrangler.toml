@@ -1,4 +1,4 @@
-name = "ebay-api-backend-2"
+name = "ebay-api-backend"
 main = "src/index.ts"
 compatibility_date = "2024-11-01"
 
