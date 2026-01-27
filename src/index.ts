@@ -19,6 +19,13 @@ async function getAppToken(env: Env): Promise<string> {
   const now = Date.now() / 1000;
   if (inMemory.token && now < inMemory.exp - 30) return inMemory.token;
 
+  // Trim to avoid trailing-space issues from secrets input
+  const clientId = (env.EBAY_CLIENT_ID || "").trim();
+  const clientSecret = (env.EBAY_CLIENT_SECRET || "").trim();
+  if (!clientId || !clientSecret) {
+    throw new Error("Missing EBAY_CLIENT_ID or EBAY_CLIENT_SECRET");
+  }
+
   if (env.TOKEN_CACHE) {
     const cached = (await env.TOKEN_CACHE.get("oauth_token", { type: "json" })) as
       | { token: string; exp: number }
@@ -34,7 +41,7 @@ async function getAppToken(env: Env): Promise<string> {
     grant_type: "client_credentials",
     scope: BROWSE_SCOPE,
   });
-  const auth = btoa(`${env.EBAY_CLIENT_ID}:${env.EBAY_CLIENT_SECRET}`);
+  const auth = btoa(`${clientId}:${clientSecret}`);
 
   const res = await fetch(`${apiRoot(env)}/identity/v1/oauth2/token`, {
     method: "POST",
@@ -83,23 +90,6 @@ const normalizeItems = (payload: any) => ({
   })),
 });
 
-const buildCompatibility = (
-  make?: string,
-  model?: string,
-  year?: string,
-  trim?: string,
-  engine?: string
-) => {
-  const parts = [
-    year && `Year:${year}`,
-    make && `Make:${make}`,
-    model && `Model:${model}`,
-    trim && `Trim:${trim}`,
-    engine && `Engine:${engine}`,
-  ].filter(Boolean) as string[];
-  return parts.length ? parts.join(";") : undefined;
-};
-
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
@@ -121,6 +111,7 @@ export default {
       const deliveryCountry = url.searchParams.get("delivery_country") || "US";
       const limit = url.searchParams.get("limit") || "20";
       const offset = url.searchParams.get("offset") || "0";
+      const categoryIds = DEFAULT_CATEGORY_ID;
 
       let query = qParam;
       if (make) query = `${make} ${query}`;
@@ -133,13 +124,11 @@ export default {
         const token = await getAppToken(env);
         const params = new URLSearchParams({
           q: query,
-          category_ids: DEFAULT_CATEGORY_ID,
+          category_ids: categoryIds,
           limit,
           offset,
         });
 
-        const compat = buildCompatibility(make, model, year, trim, engine);
-        if (compat) params.set("compatibility_filter", compat);
         if (deliveryCountry) params.set("filter", `deliveryCountry:${deliveryCountry}`);
 
         const res = await fetch(
