@@ -10,6 +10,263 @@ const BROWSE_SCOPE = "https://api.ebay.com/oauth/api_scope";
 
 const inMemory = { token: "", exp: 0 };
 
+// ============== RATE LIMITING CONFIG ==============
+const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute window
+const MAX_REQUESTS_PER_WINDOW = 60; // max requests per window
+const BURST_LIMIT = 10; // max requests in burst window
+const BURST_WINDOW_MS = 1000; // 1 second burst window
+const BLOCK_DURATION_MS = 5 * 60 * 1000; // 5 minute block for violators
+
+// In-memory rate limit store (per isolate)
+interface RateLimitEntry {
+  count: number;
+  burstCount: number;
+  windowStart: number;
+  burstWindowStart: number;
+  blockedUntil: number;
+}
+
+const rateLimitStore = new Map<string, RateLimitEntry>();
+
+// Clean up old entries periodically (every 100 requests)
+let cleanupCounter = 0;
+function cleanupRateLimitStore() {
+  cleanupCounter++;
+  if (cleanupCounter >= 100) {
+    cleanupCounter = 0;
+    const now = Date.now();
+    for (const [ip, entry] of rateLimitStore.entries()) {
+      // Remove entries that are no longer blocked and window has expired
+      if (entry.blockedUntil < now && now - entry.windowStart > RATE_LIMIT_WINDOW_MS * 2) {
+        rateLimitStore.delete(ip);
+      }
+    }
+  }
+}
+
+function getClientIP(req: Request): string {
+  // Cloudflare provides the real IP in CF-Connecting-IP header
+  return (
+    req.headers.get("CF-Connecting-IP") ||
+    req.headers.get("X-Real-IP") ||
+    req.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() ||
+    "unknown"
+  );
+}
+
+interface RateLimitResult {
+  allowed: boolean;
+  retryAfter?: number;
+  reason?: string;
+}
+
+function checkRateLimit(ip: string): RateLimitResult {
+  cleanupRateLimitStore();
+  const now = Date.now();
+
+  let entry = rateLimitStore.get(ip);
+
+  if (!entry) {
+    entry = {
+      count: 0,
+      burstCount: 0,
+      windowStart: now,
+      burstWindowStart: now,
+      blockedUntil: 0,
+    };
+    rateLimitStore.set(ip, entry);
+  }
+
+  // Check if IP is currently blocked
+  if (entry.blockedUntil > now) {
+    const retryAfter = Math.ceil((entry.blockedUntil - now) / 1000);
+    return {
+      allowed: false,
+      retryAfter,
+      reason: `IP temporarily blocked due to excessive requests. Retry after ${retryAfter} seconds.`,
+    };
+  }
+
+  // Reset window if expired
+  if (now - entry.windowStart > RATE_LIMIT_WINDOW_MS) {
+    entry.count = 0;
+    entry.windowStart = now;
+  }
+
+  // Reset burst window if expired
+  if (now - entry.burstWindowStart > BURST_WINDOW_MS) {
+    entry.burstCount = 0;
+    entry.burstWindowStart = now;
+  }
+
+  // Increment counters
+  entry.count++;
+  entry.burstCount++;
+
+  // Check burst limit
+  if (entry.burstCount > BURST_LIMIT) {
+    entry.blockedUntil = now + BLOCK_DURATION_MS;
+    const retryAfter = Math.ceil(BLOCK_DURATION_MS / 1000);
+    return {
+      allowed: false,
+      retryAfter,
+      reason: `Burst limit exceeded. IP blocked for ${retryAfter} seconds.`,
+    };
+  }
+
+  // Check rate limit
+  if (entry.count > MAX_REQUESTS_PER_WINDOW) {
+    entry.blockedUntil = now + BLOCK_DURATION_MS;
+    const retryAfter = Math.ceil(BLOCK_DURATION_MS / 1000);
+    return {
+      allowed: false,
+      retryAfter,
+      reason: `Rate limit exceeded. IP blocked for ${retryAfter} seconds.`,
+    };
+  }
+
+  return { allowed: true };
+}
+
+// ============== SECURITY CONFIG ==============
+const MAX_REQUEST_SIZE = 10 * 1024; // 10KB max request body
+const MAX_URL_LENGTH = 2048; // Max URL length
+const MAX_QUERY_PARAM_LENGTH = 500; // Max length per query parameter
+
+// Patterns that might indicate injection attempts
+const INJECTION_PATTERNS = [
+  // SQL injection patterns
+  /(\b(SELECT|INSERT|UPDATE|DELETE|DROP|CREATE|ALTER|EXEC|EXECUTE|UNION|DECLARE)\b)/gi,
+  /(-{2}|\/\*|\*\/|;)/g, // SQL comments and statement terminators
+  // NoSQL injection patterns
+  /(\$where|\$gt|\$lt|\$ne|\$regex|\$or|\$and)/gi,
+  // Script injection patterns
+  /<script\b[^>]*>/gi,
+  /javascript:/gi,
+  /on\w+\s*=/gi, // event handlers like onclick=
+  // Path traversal
+  /\.\.\//g,
+  /\.\.%2f/gi,
+  // Null bytes
+  /%00/g,
+  /\x00/g,
+  // LDAP injection
+  /[)(|*\\]/g,
+];
+
+// Allowed characters pattern (alphanumeric, spaces, common punctuation for searches)
+const SAFE_INPUT_PATTERN = /^[\p{L}\p{N}\s\-_.,'"!?@#$%&*+=:;\/\[\]{}()]+$/u;
+
+interface ValidationResult {
+  valid: boolean;
+  error?: string;
+}
+
+function sanitizeInput(input: string): string {
+  // Decode URL encoding first
+  let decoded = input;
+  try {
+    decoded = decodeURIComponent(input);
+  } catch {
+    // If decoding fails, use original
+  }
+
+  // Remove null bytes
+  decoded = decoded.replace(/%00/g, "").replace(/\x00/g, "");
+
+  // Trim and limit length
+  return decoded.trim().slice(0, MAX_QUERY_PARAM_LENGTH);
+}
+
+function checkForInjection(input: string): ValidationResult {
+  const sanitized = sanitizeInput(input);
+
+  // Check against injection patterns
+  for (const pattern of INJECTION_PATTERNS) {
+    if (pattern.test(sanitized)) {
+      // Reset regex lastIndex for global patterns
+      pattern.lastIndex = 0;
+      return {
+        valid: false,
+        error: "Potentially malicious input detected",
+      };
+    }
+  }
+
+  return { valid: true };
+}
+
+function validateQueryParams(url: URL): ValidationResult {
+  // Check URL length
+  if (url.href.length > MAX_URL_LENGTH) {
+    return { valid: false, error: "URL too long" };
+  }
+
+  // Validate each query parameter
+  for (const [key, value] of url.searchParams.entries()) {
+    // Check key length
+    if (key.length > 50) {
+      return { valid: false, error: `Parameter name '${key.slice(0, 20)}...' too long` };
+    }
+
+    // Check value length
+    if (value.length > MAX_QUERY_PARAM_LENGTH) {
+      return { valid: false, error: `Parameter '${key}' value too long` };
+    }
+
+    // Check for injection in values
+    const injectionCheck = checkForInjection(value);
+    if (!injectionCheck.valid) {
+      return { valid: false, error: `Invalid value for parameter '${key}': ${injectionCheck.error}` };
+    }
+  }
+
+  return { valid: true };
+}
+
+async function checkRequestSize(req: Request): Promise<ValidationResult> {
+  // Check Content-Length header first (if present)
+  const contentLength = req.headers.get("Content-Length");
+  if (contentLength && parseInt(contentLength) > MAX_REQUEST_SIZE) {
+    return { valid: false, error: "Request body too large" };
+  }
+
+  // For requests with body, validate actual size
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    try {
+      const body = await req.clone().text();
+      if (body.length > MAX_REQUEST_SIZE) {
+        return { valid: false, error: "Request body too large" };
+      }
+
+      // Check body for injection patterns
+      const injectionCheck = checkForInjection(body);
+      if (!injectionCheck.valid) {
+        return { valid: false, error: `Invalid request body: ${injectionCheck.error}` };
+      }
+    } catch {
+      // If we can't read the body, allow the request to proceed
+    }
+  }
+
+  return { valid: true };
+}
+
+function createSecurityErrorResponse(message: string, status: number, retryAfter?: number): Response {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+  };
+
+  if (retryAfter) {
+    headers["Retry-After"] = String(retryAfter);
+  }
+
+  return new Response(
+    JSON.stringify({ error: message }),
+    { status, headers }
+  );
+}
+
 const apiRoot = (env: Env) =>
   env.EBAY_ENV?.toLowerCase() === "production"
     ? "https://api.ebay.com"
@@ -93,6 +350,33 @@ const normalizeItems = (payload: any) => ({
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
+    const clientIP = getClientIP(req);
+
+    // ============== SECURITY CHECKS ==============
+
+    // 1. Rate limit check
+    const rateLimitResult = checkRateLimit(clientIP);
+    if (!rateLimitResult.allowed) {
+      return createSecurityErrorResponse(
+        rateLimitResult.reason || "Rate limit exceeded",
+        429,
+        rateLimitResult.retryAfter
+      );
+    }
+
+    // 2. Request size check
+    const sizeCheck = await checkRequestSize(req);
+    if (!sizeCheck.valid) {
+      return createSecurityErrorResponse(sizeCheck.error || "Request too large", 413);
+    }
+
+    // 3. Query parameter validation (injection & length checks)
+    const paramValidation = validateQueryParams(url);
+    if (!paramValidation.valid) {
+      return createSecurityErrorResponse(paramValidation.error || "Invalid request", 400);
+    }
+
+    // ============== ROUTE HANDLERS ==============
 
     if (url.pathname === "/health") {
       return Response.json({ ok: true, env: env.EBAY_ENV ?? "production" });
