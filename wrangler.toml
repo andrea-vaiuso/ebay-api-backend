@@ -5,7 +5,9 @@ compatibility_date = "2026-01-27"
 [vars]
 EBAY_ENV = "production"
 
-# Uncomment and fill if you create a KV namespace for token reuse
-# [[kv_namespaces]]
-# binding = "TOKEN_CACHE"
-# id = "<kv-id>"
+# -----------------------------
+# KV RATE LIMITER
+# -----------------------------
+[[kv_namespaces]]
+binding = "RATE_LIMITER"
+id = "a584ab29b3f744a09c2d5132f8dd1636"
